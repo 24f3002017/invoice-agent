@@ -8,7 +8,7 @@ BASE_URL = os.environ.get("BASE_URL", "https://invoice-agent-nxrd.onrender.com/a
 BASE_PATH = urlparse(BASE_URL).path.rstrip("/")
 LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
 LLM_KEY = os.environ.get("LLM_KEY", "")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.8-flash")
 DB_FILE = os.environ.get("DB_FILE", "state.json")
 
 ACTIONS = ["settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"]
