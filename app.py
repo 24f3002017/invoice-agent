@@ -1,5 +1,6 @@
 """A2A Invoice Agent - one file, Flask."""
 import os, json, time, uuid, hashlib, threading, re, traceback
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 import requests
 from flask import Flask, request, Response
@@ -9,6 +10,7 @@ BASE_PATH = urlparse(BASE_URL).path.rstrip("/")
 LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
 LLM_KEY = os.environ.get("LLM_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.8-flash")
+MODELS = [m.strip() for m in os.environ.get("LLM_MODELS", LLM_MODEL).split(",") if m.strip()]
 DB_FILE = os.environ.get("DB_FILE", "state.json")
 
 ACTIONS = ["settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"]
@@ -101,24 +103,44 @@ rationale = 60-1500 chars, name the action and quote at least two evidence refs.
 Reply with JSON only: {{"decisions":[{{"packageId":"..","action":"..","facts":{{"vendorName":"..","invoiceNumber":"..","amountMinor":0,"currency":".."}},"evidenceRefs":["..","..",".."],"rationale":".."}}]}}"""
 
 
-def call_llm(pkgs):
+def call_llm(pkgs, deadline=None):
+    deadline = deadline or (time.time() + 38)
     last = None
-    for attempt in range(2):
-        r = requests.post(LLM_URL, timeout=40, headers={"Authorization": f"Bearer {LLM_KEY}"}, json={
-            "model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
-            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": canon(pkgs)}]})
-        if r.status_code == 200:
-            txt = r.json()["choices"][0]["message"]["content"]
-            txt = re.sub(r"^```(?:json)?|```$", "", txt.strip()).strip()
-            obj = json.loads(txt)
-            return obj if isinstance(obj, list) else obj["decisions"]
-        log("LLM HTTP", r.status_code, r.text[:600])
-        last = r.status_code
-        if r.status_code == 429:
-            time.sleep(5)
-        else:
+    for attempt in range(5):
+        left = deadline - time.time()
+        if left < 4:
             break
-    raise RuntimeError(f"LLM HTTP {last}")
+        model = MODELS[attempt % len(MODELS)]
+        try:
+            r = requests.post(LLM_URL, timeout=min(left, 25),
+                              headers={"Authorization": f"Bearer {LLM_KEY}"},
+                              json={"model": model, "temperature": 0,
+                                    "response_format": {"type": "json_object"},
+                                    "messages": [{"role": "system", "content": SYSTEM},
+                                                 {"role": "user", "content": canon(pkgs)}]})
+        except Exception as ex:
+            last = repr(ex)
+            log("LLM EXC", last[:200])
+            continue
+        if r.status_code == 200:
+            try:
+                txt = r.json()["choices"][0]["message"]["content"]
+                txt = re.sub(r"^```(?:json)?|```$", "", txt.strip()).strip()
+                obj = json.loads(txt)
+                return obj if isinstance(obj, list) else obj["decisions"]
+            except Exception as ex:
+                last = "bad json " + repr(ex)
+                log("LLM BAD JSON", last[:200])
+                continue
+        last = r.status_code
+        log("LLM HTTP", r.status_code, r.text[:300])
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(1.5)
+            continue
+        if r.status_code == 404 and len(MODELS) > 1:
+            continue
+        break
+    raise RuntimeError(f"LLM failed: {last}")
 
 
 def clean(d, pkg):
@@ -149,13 +171,28 @@ def clean(d, pkg):
 
 
 def decide(pkgs):
+    start = time.time()
+    deadline = start + 40
     keys = [sha(canon({k: v for k, v in p.items() if k != "packageId"})) for p in pkgs]
     with LOCK:
         todo = [(p, k) for p, k in zip(pkgs, keys) if k not in STATE["cache"]]
+
+    def run(ch):
+        try:
+            return {d.get("packageId"): d for d in call_llm([p for p, _ in ch], deadline) if isinstance(d, dict)}
+        except Exception as ex:
+            log("CHUNK FAILED", repr(ex)[:200])
+            return {}
+
     for attempt in range(2):
-        if not todo:
+        if not todo or (attempt and time.time() - start > 25):
             break
-        out = {d.get("packageId"): d for d in call_llm([p for p, _ in todo]) if isinstance(d, dict)}
+        chunks = [todo[i:i + 3] for i in range(0, len(todo), 3)]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            outs = list(pool.map(run, chunks))
+        out = {}
+        for o in outs:
+            out.update(o)
         still = []
         for p, k in todo:
             c = clean(out.get(p.get("packageId")) or {}, p)
@@ -163,13 +200,14 @@ def decide(pkgs):
                 with LOCK:
                     STATE["cache"][k] = c
             else:
-                log("INVALID DECISION for", p.get("packageId"), canon(out.get(p.get("packageId")))[:500])
+                log("INVALID DECISION for", p.get("packageId"), canon(out.get(p.get("packageId")))[:300])
                 still.append((p, k))
         todo = still
+        with LOCK:
+            save()
     if todo:
         raise RuntimeError("model gave invalid decisions")
     with LOCK:
-        save()
         return [json.loads(json.dumps(STATE["cache"][k])) for k in keys]
 
 
